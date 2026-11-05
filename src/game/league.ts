@@ -3,16 +3,21 @@ import { AI_CLUBS } from './data';
 import { clamp, genPlayer, ovrOf, pick, playerValue, rand, randi, uid } from './players';
 import type { Pos } from './types';
 
-export function makeLeague(userName: string, userShort: string, primary: string, secondary: string): LeagueClub[] {
+export function makeLeague(userName: string, userShort: string, primary: string, secondary: string, userRating = 72): LeagueClub[] {
   return [
-    { id: 'user', name: userName, short: userShort, primary, secondary, rating: 72, isUser: true },
+    { id: 'user', name: userName, short: userShort, primary, secondary, rating: userRating, isUser: true },
     ...AI_CLUBS.map((c, i) => ({ id: 'c' + i, ...c })),
   ];
 }
 
 /** Double round robin via circle method */
 export function makeFixtures(clubs: LeagueClub[]): Fixture[] {
-  const ids = clubs.map((c) => c.id).sort(() => Math.random() - 0.5);
+  return makeFixturesFromIds(clubs.map((c) => c.id));
+}
+
+/** Same scheduler for any list of club ids (used by every league in the world DB). */
+export function makeFixturesFromIds(clubIds: string[]): Fixture[] {
+  const ids = [...clubIds].sort(() => Math.random() - 0.5);
   if (ids.length % 2) ids.push('BYE');
   const n = ids.length;
   const rounds: Fixture[] = [];

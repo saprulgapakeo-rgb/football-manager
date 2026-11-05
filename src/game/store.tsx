@@ -1,12 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { AttrKey, GameState, MarketPlayer, Player } from './types';
 import { newGame, SAVE_VERSION } from './initial';
-import { addNews, genMarket, makeFixtures, makeTable, quickSim, recordResult, sortTable, totalRounds } from './league';
-import { ageXpFactor, applyXp, clamp, ovrOf, playerValue, randi, rand, fmtMoney } from './players';
+import { addNews, quickSim, recordResult, sortTable, totalRounds } from './league';
+import { ageXpFactor, applyXp, clamp, ovrOf, playerValue, randi, rand, fmtMoney, POS_WEIGHTS } from './players';
 import { autoPick } from './formations';
 import type { MatchResult, MatchSim } from './matchEngine';
 import { luminance, textOn } from './matchEngine';
-import { LEAGUE_NAME } from './data';
+import { applyUserCupResult, buildMarket, ensureWorld, findClub, leagueNameOf, onWeekAdvanced, processSeasonEnd, recordIncoming, recordOutgoing, simulateWorldRound } from './world/engine';
 
 export type Page = 'squad' | 'match' | 'club' | 'account';
 
@@ -46,6 +46,7 @@ interface Ctx {
   slots: (SlotInfo | null)[];
   lastAutosave: number;
   runTraining: (f: TrainingFocus) => { name: string; gained: number }[] | null;
+  runAutoUpgrade: () => { name: string; gained: number }[];
   upgradePlayer: (id: string, focus: AttrKey) => { gained: number } | null;
   applyMatch: (r: MatchResult) => void;
   completeTransfer: (mp: MarketPlayer, fee: number, wage: number, years: number) => void;
@@ -64,6 +65,7 @@ export function loadAuto(account: string): GameState | null {
     if (!raw) return null;
     const s = JSON.parse(raw) as GameState;
     if (s.version !== SAVE_VERSION) return null;
+    ensureWorld(s); // safe migration: old careers keep club/squad/stats/budget/history
     return s;
   } catch { return null; }
 }
@@ -102,7 +104,7 @@ export function GameProvider({ account, children, onLogout }: { account: string;
     stateRef.current = next;
     setState(next);
   }, []);
-  const replaceState = useCallback((s: GameState) => { stateRef.current = s; setState(s); }, []);
+  const replaceState = useCallback((s: GameState) => { ensureWorld(s); stateRef.current = s; setState(s); }, []);
 
   // autosave
   useEffect(() => {
@@ -196,6 +198,36 @@ export function GameProvider({ account, children, onLogout }: { account: string;
     return report;
   };
 
+/** Automatic special-training upgrades for the best prospects. Keeps a coin reserve. */
+  const autoUpgradeSquad = (s: GameState): { name: string; gained: number }[] => {
+    const report: { name: string; gained: number }[] = [];
+    const RESERVE = 150;
+    const cands = s.squad
+      .filter((p) => p.injuredWeeks <= 0 && p.fitness >= 50 && ovrOf(p) < p.potential && p.age <= 26)
+      .sort((a, b) => (b.potential - ovrOf(b)) - (a.potential - ovrOf(a)) || a.age - b.age);
+    for (const p of cands) {
+      const cost = upgradeCost(p);
+      if (s.coins < cost + RESERVE) break;
+      s.coins -= cost;
+      const w = POS_WEIGHTS[p.pos];
+      const focus = (Object.keys(w) as AttrKey[]).sort((a, b) => (w[b] ?? 0) - (w[a] ?? 0))[0];
+      const gained = applyXp(p, Math.round(randi(30, 45) * ageXpFactor(p.age)), [focus]);
+      p.fitness = Math.max(0, p.fitness - 10);
+      report.push({ name: p.name, gained });
+    }
+    return report;
+  };
+
+  const runAutoUpgrade = () => {
+    const report: { name: string; gained: number }[] = [];
+    mutate((s) => {
+      const rep = autoUpgradeSquad(s);
+      report.push(...rep);
+      if (rep.length) addNews(s, 'training', 'Upgrade otomatis skuad', `Sesi latihan khusus otomatis diberikan kepada: ${rep.map((r) => r.name).join(', ')}.`);
+    });
+    return report;
+  };
+
   const upgradePlayer = (id: string, focus: AttrKey) => {
     const s0 = stateRef.current;
     const p0 = s0.squad.find((p) => p.id === id);
@@ -221,24 +253,109 @@ export function GameProvider({ account, children, onLogout }: { account: string;
 
   const applyMatch = (r: MatchResult) => {
     mutate((s) => {
-      const round = s.week;
-      const fx = s.fixtures.find((f) => f.round === round && (f.home === 'user' || f.away === 'user'))!;
+      ensureWorld(s);
+      const w = s.world!;
       const hg = r.homeIsUser ? r.userGoals : r.oppGoals;
       const ag = r.homeIsUser ? r.oppGoals : r.userGoals;
-      fx.hg = hg; fx.ag = ag;
-      recordResult(s.table, fx.home, fx.away, hg, ag);
       // user rating update
       const top = [...s.squad].map(ovrOf).sort((a, b) => b - a).slice(0, 11);
       const userClub = s.league.find((c) => c.isUser)!;
       userClub.rating = Math.round(top.reduce((a, b) => a + b, 0) / 11);
       userClub.name = s.club.name; userClub.short = s.club.short; userClub.primary = s.club.primary; userClub.secondary = s.club.secondary;
+
+      // ---- continental cup match (played between league weeks) ----
+      const pc = w.pendingCup;
+      const isCup = !!pc && r.opponentId === (pc.home === w.clubId ? pc.away : pc.home);
+      if (isCup) {
+        applyPlayerResults(s, r);
+        const opp = findClub(s, r.opponentId);
+        const info = applyUserCupResult(s, r);
+        const win = r.userGoals > r.oppGoals, draw = r.userGoals === r.oppGoals;
+        const coins = (win ? 150 : draw ? 90 : 50) + r.userGoals * 5;
+        const bonus = win ? 1.0 : draw ? 0.4 : 0;
+        s.coins += coins;
+        s.transferBudget = Math.round((s.transferBudget + bonus) * 10) / 10;
+        const hn = r.homeIsUser ? s.club.name : opp.name, an = r.homeIsUser ? opp.name : s.club.name;
+        addNews(s, 'match', `${info?.compName ?? 'Kompetisi'} — ${win ? 'MENANG' : draw ? 'IMBANG' : 'KALAH'}: ${hn} ${hg}-${ag} ${an}`,
+          `${r.scorers.length ? 'Pencetak gol: ' + r.scorers.join(', ') + '. ' : 'Tanpa gol tercipta. '}Man of the Match: ${r.motm}. ${info?.text ?? ''} Hadiah: +${coins} Coin${bonus ? `, bonus budget +${fmtMoney(bonus)}` : ''}.`);
+        return;
+      }
+
+      // ---- league match ----
+      const round = s.week;
+      const fx = s.fixtures.find((f) => f.round === round && (f.home === 'user' || f.away === 'user'))!;
+      fx.hg = hg; fx.ag = ag;
+      recordResult(s.table, fx.home, fx.away, hg, ag);
       for (const f of s.fixtures.filter((f) => f.round === round && f !== fx)) {
         const h = s.league.find((c) => c.id === f.home)!, a = s.league.find((c) => c.id === f.away)!;
         const [x, y] = quickSim(h.rating, a.rating);
         f.hg = x; f.ag = y;
         recordResult(s.table, f.home, f.away, x, y);
       }
-      // players
+      simulateWorldRound(s, round); // every other league in the world plays its round
+      applyPlayerResults(s, r);
+      const opp = findClub(s, r.opponentId);
+      const win = r.userGoals > r.oppGoals, draw = r.userGoals === r.oppGoals;
+      const coins = (win ? 120 : draw ? 70 : 40) + r.userGoals * 5;
+      const bonus = win ? 0.6 : draw ? 0.25 : 0;
+      s.coins += coins;
+      s.transferBudget = Math.round((s.transferBudget + bonus) * 10) / 10;
+      const hn = r.homeIsUser ? s.club.name : opp.name, an = r.homeIsUser ? opp.name : s.club.name;
+      addNews(s, 'match', `${win ? 'MENANG' : draw ? 'IMBANG' : 'KALAH'}: ${hn} ${hg}-${ag} ${an}`,
+        `${r.scorers.length ? 'Pencetak gol: ' + r.scorers.join(', ') + '. ' : 'Tanpa gol tercipta. '}Man of the Match: ${r.motm}. Hadiah: +${coins} Coin${bonus ? `, bonus budget +${fmtMoney(bonus)}` : ''}.`);
+      // advance
+      s.week++;
+      s.trainingLeft = 3;
+      // automatic development: young prospects grow on their own, veterans slowly decline
+      for (const p of s.squad) {
+        if (p.injuredWeeks > 0) continue;
+        if (p.age <= 23 && ovrOf(p) < p.potential) {
+          applyXp(p, randi(4, 9));
+        } else if (p.age >= 34 && Math.random() < 0.4) {
+          const w = POS_WEIGHTS[p.pos];
+          const keys = Object.keys(w) as AttrKey[];
+          const k = keys[randi(0, keys.length - 1)];
+          p.attrs[k] = Math.max(30, p.attrs[k] - 1);
+        } else if (p.age >= 32 && Math.random() < 0.2) {
+          const w = POS_WEIGHTS[p.pos];
+          const keys = Object.keys(w) as AttrKey[];
+          const k = keys[randi(0, keys.length - 1)];
+          p.attrs[k] = Math.max(30, p.attrs[k] - 1);
+        }
+      }
+      if (s.autoUpgrade) {
+        const rep = autoUpgradeSquad(s);
+        if (rep.length) addNews(s, 'training', 'Upgrade otomatis skuad', `Sesi latihan khusus otomatis diberikan kepada: ${rep.map((r) => r.name).join(', ')}.`);
+      }
+      // re-validate lineup (injuries)
+      if (s.lineup.some((id) => s.squad.find((p) => p.id === id)?.injuredWeeks)) {
+        const ap = autoPick(s.squad, s.tactics.formation);
+        s.lineup = ap.lineup; s.bench = ap.bench;
+        addNews(s, 'club', 'Cedera memaksa perubahan susunan pemain', 'Staf pelatih menyesuaikan starting XI karena ada pemain yang cedera.');
+      }
+      if (s.week % 4 === 0) {
+        const keep = s.market.filter((m) => m.status === 'available').slice(0, 12);
+        s.market = [...keep, ...buildMarket(s, 24 - keep.length)].sort((a, b) => ovrOf(b) - ovrOf(a));
+        addNews(s, 'transfer', 'Bursa transfer diperbarui', 'Agen-agen menawarkan daftar pemain baru dari klub-klub di seluruh dunia. Pemain yang sebelumnya menolak kini sudah pindah ke tempat lain.');
+      }
+      if (s.week >= totalRounds(s.league)) {
+        const sorted = sortTable(s.table);
+        const champ = findClub(s, sorted[0].clubId);
+        const pos = sorted.findIndex((t) => t.clubId === 'user') + 1;
+        const prize = Math.max(5, (s.league.length + 1 - pos) * 1.5);
+        addNews(s, 'season', `${champ.name} juara ${leagueNameOf(s)} musim ${s.season}!`, `${s.club.name} finis di posisi #${pos} dari ${s.league.length}. Manajemen memberikan transfer budget musim baru +${fmtMoney(prize)} dan 500 Coin.`);
+        s.transferBudget = Math.round((s.transferBudget + prize) * 10) / 10;
+        s.coins += 500;
+        processSeasonEnd(s, 5); // finishes world leagues & cups, promotion/relegation, new fixtures, season++
+        s.squad.forEach((p) => { p.age++; p.fitness = 100; if (p.contractYears) p.contractYears = Math.max(0, p.contractYears - 1); });
+      } else {
+        onWeekAdvanced(s); // continental matchdays scheduled for the new week
+      }
+    });
+  };
+
+  /** Shared post-match bookkeeping for the user's players (league and cup). */
+  const applyPlayerResults = (s: GameState, r: MatchResult) => {
       const played = new Map(r.players.map((p) => [p.id, p]));
       for (const p of s.squad) {
         if (p.injuredWeeks > 0) p.injuredWeeks--;
@@ -253,44 +370,6 @@ export function GameProvider({ account, children, onLogout }: { account: string;
         p.fitness = clamp(p.fitness + 22, 0, 100);
       }
       s.squad.forEach((p) => { if (p.injuredWeeks > 0) p.fitness = Math.min(p.fitness, 60); });
-      const opp = s.league.find((c) => c.id === r.opponentId)!;
-      const win = r.userGoals > r.oppGoals, draw = r.userGoals === r.oppGoals;
-      const coins = (win ? 120 : draw ? 70 : 40) + r.userGoals * 5;
-      const bonus = win ? 0.6 : draw ? 0.25 : 0;
-      s.coins += coins;
-      s.transferBudget = Math.round((s.transferBudget + bonus) * 10) / 10;
-      const hn = r.homeIsUser ? s.club.name : opp.name, an = r.homeIsUser ? opp.name : s.club.name;
-      addNews(s, 'match', `${win ? 'MENANG' : draw ? 'IMBANG' : 'KALAH'}: ${hn} ${hg}-${ag} ${an}`,
-        `${r.scorers.length ? 'Pencetak gol: ' + r.scorers.join(', ') + '. ' : 'Tanpa gol tercipta. '}Man of the Match: ${r.motm}. Hadiah: +${coins} Coin${bonus ? `, bonus budget +${fmtMoney(bonus)}` : ''}.`);
-      // advance
-      s.week++;
-      s.trainingLeft = 3;
-      // re-validate lineup (injuries)
-      if (s.lineup.some((id) => s.squad.find((p) => p.id === id)?.injuredWeeks)) {
-        const ap = autoPick(s.squad, s.tactics.formation);
-        s.lineup = ap.lineup; s.bench = ap.bench;
-        addNews(s, 'club', 'Cedera memaksa perubahan susunan pemain', 'Staf pelatih menyesuaikan starting XI karena ada pemain yang cedera.');
-      }
-      if (s.week % 4 === 0) {
-        const keep = s.market.filter((m) => m.status === 'available').slice(0, 12);
-        s.market = [...keep, ...genMarket(s.league, 24 - keep.length)].sort((a, b) => ovrOf(b) - ovrOf(a));
-        addNews(s, 'transfer', 'Bursa transfer diperbarui', 'Agen-agen menawarkan daftar pemain baru. Pemain yang sebelumnya menolak kini sudah pindah ke tempat lain.');
-      }
-      if (s.week >= totalRounds(s.league)) {
-        const sorted = sortTable(s.table);
-        const champ = s.league.find((c) => c.id === sorted[0].clubId)!;
-        const pos = sorted.findIndex((t) => t.clubId === 'user') + 1;
-        const prize = Math.max(5, (11 - pos) * 3);
-        addNews(s, 'season', `${champ.name} juara ${LEAGUE_NAME} musim ${s.season}!`, `${s.club.name} finis di posisi #${pos}. Manajemen memberikan transfer budget musim baru +${fmtMoney(prize)} dan 500 Coin.`);
-        s.transferBudget += prize;
-        s.coins += 500;
-        s.season++;
-        s.week = 0;
-        s.fixtures = makeFixtures(s.league);
-        s.table = makeTable(s.league);
-        s.squad.forEach((p) => { p.age++; p.fitness = 100; });
-      }
-    });
   };
 
   const completeTransfer = (mp: MarketPlayer, fee: number, wage: number, years: number) => {
@@ -302,10 +381,13 @@ export function GameProvider({ account, children, onLogout }: { account: string;
       const p: Player = {
         id: mp.id, name: mp.name, nation: mp.nation, pos: mp.pos, age: mp.age, num, attrs: mp.attrs, potential: mp.potential,
         fitness: mp.fitness, form: mp.form, xp: mp.xp, injuredWeeks: 0, wage, apps: 0, goals: 0, assists: 0, ratingSum: 0,
+        contractYears: years,
       };
       s.squad.push(p);
       if (s.bench.length < 9) s.bench.push(p.id);
       s.market = s.market.filter((m) => m.id !== mp.id);
+      ensureWorld(s);
+      recordIncoming(s, mp, fee); // removes him from the selling club's squad + transfer history
       addNews(s, 'transfer', `DONE DEAL ✍️ ${mp.name} resmi bergabung dengan ${s.club.name}`,
         `${s.club.name} mendatangkan ${mp.name} (${mp.pos}, ${ovrOf(mp)} OVR) dari ${mp.club} dengan biaya ${fmtMoney(fee)}. Kontrak ${years} tahun dengan gaji €${wage}K/minggu.`);
     });
@@ -327,8 +409,9 @@ export function GameProvider({ account, children, onLogout }: { account: string;
     if (s0.squad.length <= 18) { toast('Skuad minimal 18 pemain', 'err'); return; }
     const p = s0.squad.find((x) => x.id === id)!;
     const fee = Math.round(playerValue(ovrOf(p), p.age, p.potential) * rand(0.8, 1.0) * 10) / 10;
-    const buyer = s0.league.filter((c) => !c.isUser)[randi(0, s0.league.length - 2)];
     mutate((s) => {
+      ensureWorld(s);
+      const buyer = recordOutgoing(s, p, fee); // real club from the world DB receives the player
       s.squad = s.squad.filter((x) => x.id !== id);
       s.bench = s.bench.filter((x) => x !== id);
       if (s.lineup.includes(id)) {
@@ -346,7 +429,7 @@ export function GameProvider({ account, children, onLogout }: { account: string;
 
   const value: Ctx = {
     state, mutate, replaceState, page, setPage, accent, accentText: textOn(accent), logout: onLogout, toast,
-    saveSlot, loadSlot, deleteSlot, slots, lastAutosave, runTraining, upgradePlayer, applyMatch, completeTransfer,
+    saveSlot, loadSlot, deleteSlot, slots, lastAutosave, runTraining, runAutoUpgrade, upgradePlayer, applyMatch, completeTransfer,
     rejectTransfer, sellPlayer, matchRef, coinTick,
   };
 

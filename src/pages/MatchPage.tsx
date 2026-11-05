@@ -3,11 +3,15 @@ import { useGame } from '@/game/store';
 import { Bar, Button, Card, FormChips, Modal, OvrBadge, PosBadge, RatingBadge, Scale, Segmented } from '@/components/ui';
 import { ClubLogo, PitchLines } from '@/components/ClubVisuals';
 import { buildResult, createSim, setTactics, step, substitute, updatePositions, type MatchSim, type SimPlayer } from '@/game/matchEngine';
+import { MatchCanvas, type MatchQuality } from '@/components/MatchCanvas';
+import { TACTIC_PRESETS, presetMatches } from '@/game/presets';
 import { sortTable } from '@/game/league';
 import { FORMATIONS, FORMATION_LIST } from '@/game/formations';
-import { MENTALITY_LABELS, PRESSING_LABELS, TEMPO_LABELS, LEAGUE_NAME } from '@/game/data';
+import { MENTALITY_LABELS, PRESSING_LABELS, TEMPO_LABELS } from '@/game/data';
+import { findClub, getNextMatch, leagueNameOf, type NextMatch } from '@/game/world/engine';
+import { CLUB_BY_ID, LEAGUE_BY_ID } from '@/game/world/db';
 import { slotRating, POS_GROUP } from '@/game/players';
-import type { LeagueClub, Tactics } from '@/game/types';
+import type { LeagueClub, Player, Tactics } from '@/game/types';
 import { cn } from '@/utils/cn';
 
 function TeamBadge({ club, size = 56 }: { club: LeagueClub; size?: number }) {
@@ -18,18 +22,26 @@ function TeamBadge({ club, size = 56 }: { club: LeagueClub; size?: number }) {
 
 export function MatchPage() {
   const { state, matchRef, applyMatch, mutate } = useGame();
-  const [, setFrame] = useState(0);
+  const [, setTick] = useState(0);
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(1);
+  const [quality, setQuality] = useState<MatchQuality>(() => (localStorage.getItem('fmco:match-quality') as MatchQuality) || 'medium');
   const [selected, setSelected] = useState<{ team: 0 | 1; id: string } | null>(null);
   const [goalFlash, setGoalFlash] = useState<string | null>(null);
   const [tab, setTab] = useState<'feed' | 'ratings' | 'stats'>('feed');
   const runRef = useRef(running); runRef.current = running;
   const speedRef = useRef(speed); speedRef.current = speed;
   const goalsRef = useRef(matchRef.current ? matchRef.current.score[0] + matchRef.current.score[1] : 0);
+  const drawHandle = useRef<(() => void) | null>(null);
+  const dirtyRef = useRef(true);
+
+  useEffect(() => { localStorage.setItem('fmco:match-quality', quality); }, [quality]);
+  useEffect(() => { dirtyRef.current = true; drawHandle.current?.(); }, [selected, quality]);
 
   useEffect(() => {
     let raf = 0, last = performance.now();
+    let syncEv = -1, syncS0 = -1, syncS1 = -1, syncMin = -1, syncSubs = '', syncClock = 0;
+    let animActive = false; // true while a substitution walk-on is playing on the canvas
     const loop = (t: number) => {
       const dt = Math.min(0.1, (t - last) / 1000); last = t;
       const sim = matchRef.current;
@@ -43,11 +55,23 @@ export function MatchPage() {
         if (goals > goalsRef.current) {
           goalsRef.current = goals;
           const ev = sim.events.find((e) => e.type === 'goal');
-          setGoalFlash(ev?.team === 0 ? sim.teams[0].name : sim.teams[1].name);
+          const teamName = ev?.team === 0 ? sim.teams[0].name : sim.teams[1].name;
+          setGoalFlash(sim.celebration ? `${sim.celebration.scorerName} · ${teamName}` : teamName);
           setTimeout(() => setGoalFlash(null), 2200);
         }
       }
-      if (sim) setFrame((f) => (f + 1) % 1e6);
+      if (sim) {
+        // Canvas renders every frame while running (no React re-render); UI syncs only on change.
+        // It also keeps rendering while a substitution walk-on plays, even when paused.
+        if (runRef.current || dirtyRef.current || animActive) { animActive = drawHandle.current?.() ?? false; dirtyRef.current = false; }
+        const min = Math.floor(sim.minute);
+        const subs = sim.teams[0].subsUsed + ':' + sim.teams[1].subsUsed;
+        const beat = runRef.current && t - syncClock > 600;
+        if (sim.evId !== syncEv || sim.score[0] !== syncS0 || sim.score[1] !== syncS1 || min !== syncMin || subs !== syncSubs || beat) {
+          syncEv = sim.evId; syncS0 = sim.score[0]; syncS1 = sim.score[1]; syncMin = min; syncSubs = subs; syncClock = t;
+          setTick((x) => (x + 1) % 1e6);
+        }
+      }
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
@@ -55,12 +79,12 @@ export function MatchPage() {
   }, [matchRef]);
 
   const sim = matchRef.current;
-  const fixture = state.fixtures.find((f) => f.round === state.week && (f.home === 'user' || f.away === 'user'));
+  const next = getNextMatch(state);
 
   if (!sim) {
-    if (!fixture) return <Card>Tidak ada jadwal pertandingan.</Card>;
-    return <PreMatch onKickoff={(opp, home) => {
-      matchRef.current = createSim(state, opp, home);
+    if (!next) return <Card>Tidak ada jadwal pertandingan.</Card>;
+    return <PreMatch next={next} onKickoff={(opp, home, oppSquad) => {
+      matchRef.current = createSim(state, opp, home, oppSquad);
       goalsRef.current = 0;
       setSelected(null);
       setRunning(true);
@@ -74,7 +98,7 @@ export function MatchPage() {
   const minute = Math.min(Math.floor(sim.minute), 90 + sim.stoppage);
   const possT = sim.stats.poss[0] + sim.stats.poss[1] || 1;
   const uPoss = Math.round((sim.stats.poss[0] / possT) * 100);
-  const oppClub = state.league.find((c) => c.id === sim.opponentId)!;
+  const oppClub = findClub(state, sim.opponentId);
   const userClub = state.league.find((c) => c.isUser)!;
 
   const selPlayer = selected ? sim.teams[selected.team].onPitch.find((p) => p.id === selected.id) : undefined;
@@ -130,28 +154,14 @@ export function MatchPage() {
               <span className="text-slate-400">Klik pemain untuk melihat kondisi</span>
               <span className="flex items-center gap-1.5">menyerang ← {o.short}<span className="h-3 w-3 rounded-full border" style={{ background: o.kit }} /></span>
             </div>
-            <svg viewBox="-3 -3 111 74" className="block w-full select-none">
-              <PitchLines />
-              {/* shadow of ball */}
-              {sim.teams.map((t, ti) => t.onPitch.map((p) => {
-                const sel = selected?.id === p.id;
-                const hasBall = sim.possession === ti && t.onPitch[sim.carrier]?.id === p.id;
-                return (
-                  <g key={p.id} transform={`translate(${p.x * 1.05} ${p.y * 0.68})`} className="cursor-pointer" onClick={() => setSelected({ team: ti as 0 | 1, id: p.id })}>
-                    <circle r="2.6" fill="transparent" />
-                    {sel && <circle r="2.8" fill="none" stroke="#facc15" strokeWidth="0.4" className="animate-pulse" />}
-                    {hasBall && <circle r="2.3" fill="none" stroke="#fff" strokeWidth="0.2" strokeDasharray="0.6 0.4" />}
-                    <circle r="1.75" fill={t.kit} stroke={p.role === 'GK' ? '#facc15' : ti === 0 ? state.club.secondary : '#0b1220'} strokeWidth="0.35" />
-                    <text y="0.55" textAnchor="middle" fontSize="1.5" fontWeight="900" fill={t.kitText} style={{ pointerEvents: 'none' }}>{p.num}</text>
-                    {ti === 0 && p.fitness < 55 && <circle cx="1.5" cy="-1.5" r="0.55" fill="#f43f5e" />}
-                    {p.injured && <text x="-2.6" y="-1.2" fontSize="1.6">🚑</text>}
-                    {p.yellow > 0 && <rect x="1.1" y="0.6" width="0.8" height="1.1" fill="#facc15" />}
-                  </g>
-                );
-              }))}
-              <ellipse cx={sim.ball.x * 1.05 + 0.3} cy={sim.ball.y * 0.68 + 0.4} rx="0.7" ry="0.35" fill="rgba(0,0,0,0.35)" />
-              <circle cx={sim.ball.x * 1.05} cy={sim.ball.y * 0.68} r="0.75" fill="#fff" stroke="#111" strokeWidth="0.15" />
-            </svg>
+            <MatchCanvas
+              getSim={() => matchRef.current}
+              selectedId={selected?.id ?? null}
+              onSelect={(team, id) => setSelected({ team, id })}
+              quality={quality}
+              userSecondary={state.club.secondary}
+              drawHandle={drawHandle}
+            />
             {goalFlash && (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
                 <div className="animate-[pop_.4s_ease-out] text-center">
@@ -174,6 +184,12 @@ export function MatchPage() {
             <div className="flex items-center gap-1 rounded-lg bg-black/30 p-1">
               {[1, 2, 4].map((s) => (
                 <button key={s} onClick={() => setSpeed(s)} className={cn('rounded-md px-3 py-1.5 text-xs font-bold', speed === s ? 'bg-white/15 text-white' : 'text-slate-500 hover:text-slate-300')}>{s}x</button>
+              ))}
+            </div>
+            <div className="flex items-center gap-1 rounded-lg bg-black/30 p-1" title="Kualitas grafis pertandingan">
+              <span className="pl-2 text-xs">🎨</span>
+              {([['low', 'R', 'Rendah'], ['medium', 'S', 'Sedang'], ['high', 'T', 'Tinggi']] as [MatchQuality, string, string][]).map(([q, short, label]) => (
+                <button key={q} title={label} onClick={() => setQuality(q)} className={cn('rounded-md px-2.5 py-1.5 text-xs font-bold', quality === q ? 'bg-white/15 text-white' : 'text-slate-500 hover:text-slate-300')}>{short}</button>
               ))}
             </div>
             <div className="ml-auto flex items-center gap-3 rounded-lg bg-black/30 px-3 py-2 text-xs">
@@ -253,15 +269,16 @@ export function MatchPage() {
   );
 }
 
-function PreMatch({ onKickoff }: { onKickoff: (opp: LeagueClub, home: boolean) => void }) {
+function PreMatch({ next, onKickoff }: { next: NextMatch; onKickoff: (opp: LeagueClub, home: boolean, oppSquad: Player[]) => void }) {
   const { state, setPage } = useGame();
-  const fx = state.fixtures.find((f) => f.round === state.week && (f.home === 'user' || f.away === 'user'))!;
-  const homeIsUser = fx.home === 'user';
-  const opp = state.league.find((c) => c.id === (homeIsUser ? fx.away : fx.home))!;
+  const { homeIsUser, opp } = next;
+  const isCup = next.kind === 'cup';
   const user = state.league.find((c) => c.isUser)!;
   const table = sortTable(state.table);
-  const rowOf = (id: string) => table.find((r) => r.clubId === id)!;
+  const rowOf = (id: string) => table.find((r) => r.clubId === id) ?? { pts: 0, form: [] as ('W' | 'D' | 'L')[] };
   const posOf = (id: string) => table.findIndex((r) => r.clubId === id) + 1;
+  const dbOpp = CLUB_BY_ID.get(opp.id);
+  const oppLeague = dbOpp ? LEAGUE_BY_ID.get(dbOpp.leagueId)?.name : undefined;
   const byId = new Map(state.squad.map((p) => [p.id, p]));
   const slots = FORMATIONS[state.tactics.formation];
   const xi = state.lineup.map((id) => byId.get(id));
@@ -275,7 +292,7 @@ function PreMatch({ onKickoff }: { onKickoff: (opp: LeagueClub, home: boolean) =
     <div className="space-y-5">
       <div>
         <h1 className="text-2xl font-black text-white">Match Day</h1>
-        <p className="text-sm text-slate-400">{LEAGUE_NAME} · Pekan {state.week + 1}</p>
+        <p className="text-sm text-slate-400">{isCup ? '🏆 ' : ''}{next.title} · {next.sub}</p>
       </div>
       <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-slate-950">
         <svg viewBox="0 0 105 68" className="absolute inset-0 h-full w-full opacity-25" preserveAspectRatio="xMidYMid slice"><PitchLines /></svg>
@@ -286,7 +303,7 @@ function PreMatch({ onKickoff }: { onKickoff: (opp: LeagueClub, home: boolean) =
               <TeamBadge club={c} size={96} />
               <div>
                 <div className="text-lg font-black text-white sm:text-2xl">{c.isUser ? state.club.name : c.name}</div>
-                <div className="text-xs text-slate-400">#{posOf(c.id)} · {rowOf(c.id).pts} poin · Rating {c.isUser ? xiRating : c.rating}</div>
+                <div className="text-xs text-slate-400">{isCup && !c.isUser ? `${oppLeague ?? 'Tamu'} · ` : `#${posOf(c.id)} · ${rowOf(c.id).pts} poin · `}Rating {c.isUser ? xiRating : c.rating}</div>
                 <div className="mt-1 flex justify-center gap-1">
                   {rowOf(c.id).form.map((f, j) => <span key={j} className={cn('flex h-5 w-5 items-center justify-center rounded text-[10px] font-black', f === 'W' ? 'bg-emerald-500 text-emerald-950' : f === 'D' ? 'bg-slate-500 text-white' : 'bg-rose-500 text-white')}>{f === 'W' ? 'M' : f === 'D' ? 'S' : 'K'}</span>)}
                 </div>
@@ -295,11 +312,12 @@ function PreMatch({ onKickoff }: { onKickoff: (opp: LeagueClub, home: boolean) =
           ))}
           <div className="order-2 text-center">
             <div className="text-4xl font-black text-slate-500">VS</div>
-            <div className="mt-2 text-xs text-slate-500">{homeIsUser ? 'Laga Kandang' : 'Laga Tandang'}</div>
+            <div className="mt-2 text-xs text-slate-500">{homeIsUser ? 'Laga Kandang' : 'Laga Tandang'}{isCup ? ` · ${next.sub}` : ''}</div>
+            {dbOpp && <div className="mt-1 text-[10px] text-slate-600">🏟️ {homeIsUser ? '' : dbOpp.stadium}</div>}
           </div>
         </div>
         <div className="relative flex flex-col items-center gap-3 pb-8">
-          <Button size="lg" className="px-10 text-lg" onClick={() => onKickoff(opp, homeIsUser)}>⚽ KICK-OFF</Button>
+          <Button size="lg" className="px-10 text-lg" onClick={() => onKickoff(opp, homeIsUser, next.oppSquad)}>⚽ KICK-OFF</Button>
           <button onClick={() => setPage('squad')} className="text-xs text-slate-400 underline-offset-2 hover:text-white hover:underline">Ubah susunan pemain & taktik</button>
         </div>
       </div>
@@ -352,17 +370,21 @@ function PreMatch({ onKickoff }: { onKickoff: (opp: LeagueClub, home: boolean) =
   );
 }
 
-export function LeagueTable() {
+export function LeagueTable({ leagueId }: { leagueId?: string } = {}) {
   const { state } = useGame();
-  const table = sortTable(state.table);
+  const w = state.world;
+  const foreign = !!leagueId && !!w && leagueId !== w.leagueId;
+  const table = sortTable(foreign ? (w!.tables[leagueId!] ?? []) : state.table);
+  const title = foreign ? (LEAGUE_BY_ID.get(leagueId!)?.name ?? leagueId) : leagueNameOf(state);
+  const clubOf = (id: string): LeagueClub => (foreign ? findClub(state, id) : state.league.find((x) => x.id === id) ?? findClub(state, id));
   return (
-    <Card title={`Klasemen ${LEAGUE_NAME}`} icon="■">
+    <Card title={`Klasemen ${title}`} icon="■">
       <div className="-mx-4 -my-4 overflow-x-auto">
         <table className="w-full min-w-[520px] text-sm">
           <thead><tr className="text-[10px] uppercase tracking-wider text-slate-500">{['#', 'Klub', 'Main', 'M', 'S', 'K', 'GM', 'GK', 'SG', 'Poin'].map((h) => <th key={h} className="px-2 py-2 text-left first:pl-4">{h}</th>)}</tr></thead>
           <tbody>
             {table.map((r, i) => {
-              const c = state.league.find((x) => x.id === r.clubId)!;
+              const c = clubOf(r.clubId);
               return (
                 <tr key={r.clubId} className={cn('border-t border-white/5', c.isUser && 'bg-[var(--accent)]/10 font-bold')}>
                   <td className="py-1.5 pl-4 pr-2 text-slate-400">{i + 1}</td>
@@ -398,6 +420,18 @@ function LiveTactics({ sim }: { sim: MatchSim }) {
           <button disabled={sim.finished} onClick={() => apply({ ...cur, mentality: 1, tempo: 2, pressing: 2 }, '📣 Parkir bus! Amankan hasil.')} className="rounded-lg bg-sky-500/15 px-2 py-2 text-[11px] font-bold text-sky-200 hover:bg-sky-500/25">🚌 Parkir Bus</button>
           <button disabled={sim.finished} onClick={() => apply({ ...cur, pressing: 5 }, '📣 Tekan tinggi, rebut bola!')} className="rounded-lg bg-amber-500/15 px-2 py-2 text-[11px] font-bold text-amber-200 hover:bg-amber-500/25">⚡ High Press</button>
         </div>
+        <div>
+          <div className="mb-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-500">Preset Taktik</div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {TACTIC_PRESETS.map((pr) => (
+              <button key={pr.id} disabled={sim.finished} title={pr.desc} onClick={() => apply({ ...pr.tactics }, `${pr.icon} Taktik ${pr.name} diterapkan`)}
+                className={cn('rounded-lg border px-2 py-1.5 text-left text-[11px] font-bold transition disabled:opacity-40',
+                  presetMatches(pr, cur) ? 'border-[var(--accent)] bg-[var(--accent)]/15 text-white' : 'border-white/10 bg-black/20 text-slate-300 hover:border-white/25')}>
+                {pr.icon} {pr.name}
+              </button>
+            ))}
+          </div>
+        </div>
         <Segmented options={FORMATION_LIST} value={draft.formation} onChange={(f) => setDraft({ ...draft, formation: f })} />
         <Scale label="Mentalitas" value={draft.mentality} labels={MENTALITY_LABELS} onChange={(v) => setDraft({ ...draft, mentality: v })} />
         <Scale label="Tempo" value={draft.tempo} labels={TEMPO_LABELS} onChange={(v) => setDraft({ ...draft, tempo: v })} />
@@ -409,7 +443,9 @@ function LiveTactics({ sim }: { sim: MatchSim }) {
 }
 
 function SubPanel({ sim, sel, selTeam, onSelect }: { sim: MatchSim; sel?: SimPlayer; selTeam: 0 | 1; onSelect: (id: string) => void }) {
-  const { toast } = useGame();
+  const { toast, state, mutate } = useGame();
+  const autoSub = state.autoSub ?? true;
+  const thr = state.autoSubThreshold ?? 60;
   const t = sim.teams[0];
   const isUser = selTeam === 0;
   const doSub = (benchId: string) => {
@@ -420,6 +456,24 @@ function SubPanel({ sim, sel, selTeam, onSelect }: { sim: MatchSim; sel?: SimPla
   const tired = t.onPitch.filter((p) => p.fitness < 60 || p.injured || p.rating < 6);
   return (
     <Card title="Kondisi & Pergantian" icon="🔁" action={<span className="text-xs font-bold text-slate-400">Sisa: <span className="text-[var(--accent)]">{5 - t.subsUsed}/5</span></span>}>
+      <div className="mb-3 rounded-xl border border-white/10 bg-black/20 p-2.5">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-bold text-white">🔁 Pergantian Otomatis</span>
+          <button onClick={() => { const v = !autoSub; sim.autoSub = v; mutate((s) => { s.autoSub = v; }); toast(v ? 'Pergantian otomatis aktif' : 'Pergantian otomatis nonaktif', 'info'); }}
+            className={cn('relative h-6 w-11 rounded-full transition', autoSub ? 'bg-[var(--accent)]' : 'bg-white/15')}>
+            <span className={cn('absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all', autoSub ? 'left-[22px]' : 'left-0.5')} />
+          </button>
+        </div>
+        {autoSub && (
+          <div className="mt-2 flex items-center gap-1">
+            <span className="text-[10px] text-slate-500">Ganti saat fitness &lt;</span>
+            {[50, 60, 70].map((v) => (
+              <button key={v} onClick={() => { sim.autoSubThreshold = v; mutate((s) => { s.autoSubThreshold = v; }); }}
+                className={cn('rounded px-2 py-0.5 text-[11px] font-bold', thr === v ? 'bg-[var(--accent)] text-[var(--accent-text)]' : 'bg-white/5 text-slate-400 hover:bg-white/10')}>{v}</button>
+            ))}
+          </div>
+        )}
+      </div>
       {!sel ? (
         <div className="space-y-2">
           <p className="text-sm text-slate-400">Klik pemain di lapangan untuk melihat fitness & performanya.</p>

@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
 import { useGame, TRAINING, upgradeCost, type TrainingFocus } from '@/game/store';
+import { TACTIC_PRESETS, presetMatches } from '@/game/presets';
 import { Bar, Button, Card, FormChips, Modal, OvrBadge, PosBadge, RatingBadge, Scale, Segmented, Stat } from '@/components/ui';
 import { FORMATIONS, FORMATION_LIST, autoPick } from '@/game/formations';
 import { ATTR_KEYS, POS_GROUP, avgForm, fmtMoney, ovrOf, playerValue, slotRating } from '@/game/players';
 import { ATTR_LABELS, ATTR_SHORT, MENTALITY_LABELS, NATION_FLAGS, PRESSING_LABELS, TEMPO_LABELS } from '@/game/data';
-import type { AttrKey, Player } from '@/game/types';
+import type { AttrKey, Player, Tactics } from '@/game/types';
 import { cn } from '@/utils/cn';
 import { PitchLines, Jersey } from '@/components/ClubVisuals';
 import { textOn } from '@/game/matchEngine';
@@ -14,13 +15,14 @@ type Sort = 'pos' | 'ovr' | 'pot' | 'fit' | 'form' | 'age';
 const POS_ORDER = ['GK', 'CB', 'LB', 'RB', 'CDM', 'CM', 'CAM', 'LM', 'RM', 'LW', 'RW', 'ST'];
 
 export function SquadPage() {
-  const { state, mutate, runTraining, toast } = useGame();
+  const { state, mutate, runTraining, runAutoUpgrade, toast } = useGame();
   const [filter, setFilter] = useState<Filter>('ALL');
   const [sort, setSort] = useState<Sort>('pos');
   const [detail, setDetail] = useState<string | null>(null);
   const [slotPick, setSlotPick] = useState<number | null>(null);
   const [focus, setFocus] = useState<TrainingFocus>('technique');
   const [report, setReport] = useState<{ focus: TrainingFocus; items: { name: string; gained: number }[] } | null>(null);
+  const [autoReport, setAutoReport] = useState<{ name: string; gained: number }[] | null>(null);
 
   const byId = useMemo(() => new Map(state.squad.map((p) => [p.id, p])), [state.squad]);
   const slots = FORMATIONS[state.tactics.formation];
@@ -67,6 +69,15 @@ export function SquadPage() {
     const ap = autoPick(state.squad, state.tactics.formation);
     mutate((s) => { s.lineup = ap.lineup; s.bench = ap.bench; });
     toast('Starting XI terbaik dipilih otomatis');
+  };
+
+  const applyPreset = (t: Tactics, name: string) => {
+    mutate((s) => {
+      const changed = s.tactics.formation !== t.formation;
+      s.tactics = { ...t };
+      if (changed) s.familiarity = Math.max(0, s.familiarity - 8);
+    });
+    toast(`Taktik ${name} diterapkan`);
   };
 
   const train = () => {
@@ -153,6 +164,18 @@ export function SquadPage() {
           <Card title="Taktik" icon="◆" action={<Button size="sm" variant="ghost" onClick={doAuto}>⚡ Auto XI</Button>}>
             <div className="space-y-4">
               <div>
+                <div className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400">Preset Taktik</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {TACTIC_PRESETS.map((pr) => (
+                    <button key={pr.id} title={pr.desc} onClick={() => applyPreset(pr.tactics, pr.name)}
+                      className={cn('rounded-lg border px-2 py-2 text-left text-[11px] font-bold transition',
+                        presetMatches(pr, state.tactics) ? 'border-[var(--accent)] bg-[var(--accent)]/15 text-white' : 'border-white/10 bg-black/20 text-slate-300 hover:border-white/25')}>
+                      {pr.icon} {pr.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
                 <div className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400">Formasi</div>
                 <Segmented options={FORMATION_LIST} value={state.tactics.formation} onChange={(f) => f !== state.tactics.formation && mutate((s) => { s.tactics.formation = f; s.familiarity = Math.max(0, s.familiarity - 8); })} />
               </div>
@@ -225,6 +248,29 @@ export function SquadPage() {
                 {report.items.length ? report.items.map((r) => <div key={r.name} className="text-emerald-300">▲ {r.name} +{r.gained} OVR</div>) : <div className="text-slate-500">Belum ada kenaikan OVR, progres XP tetap bertambah.</div>}
               </div>
             )}
+            <div className="mt-4 rounded-xl border border-[var(--accent)]/30 bg-[var(--accent)]/5 p-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-bold text-white">⚡ Upgrade Otomatis</div>
+                <button onClick={() => mutate((s) => { s.autoUpgrade = !(s.autoUpgrade ?? false); })}
+                  className={cn('relative h-6 w-11 rounded-full transition', (state.autoUpgrade ?? false) ? 'bg-[var(--accent)]' : 'bg-white/15')}>
+                  <span className={cn('absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all', (state.autoUpgrade ?? false) ? 'left-[22px]' : 'left-0.5')} />
+                </button>
+              </div>
+              <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                Otomatis memberi sesi latihan khusus ke prospek terbaik (usia ≤26, masih jauh dari potensi) memakai Coin, dengan cadangan 150 Coin.
+                Pemain muda (≤23 th) juga berkembang sendiri tiap pekan; pemain senior (≥32 th) perlahan menurun.
+              </p>
+              <Button variant="outline" size="sm" className="mt-2 w-full" onClick={() => {
+                const r = runAutoUpgrade();
+                setAutoReport(r);
+                toast(r.length ? `⚡ Upgrade otomatis: ${r.length} pemain dilatih` : 'Tidak ada prospek yang memenuhi syarat / Coin kurang', r.length ? 'ok' : 'info');
+              }}>⚡ Jalankan Upgrade Otomatis Sekarang</Button>
+              {autoReport && (
+                <div className="mt-2 text-xs">
+                  {autoReport.length ? autoReport.map((r) => <div key={r.name} className="text-emerald-300">▲ {r.name} +{r.gained} OVR</div>) : <div className="text-slate-500">Tidak ada pemain yang dilatih (syarat: usia ≤26, fitness ≥50, belum maks potensi, Coin &gt; biaya + 150).</div>}
+                </div>
+              )}
+            </div>
           </Card>
         </div>
       </div>

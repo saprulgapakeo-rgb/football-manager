@@ -1,13 +1,15 @@
 import { useMemo, useRef, useState } from 'react';
 import { useGame } from '@/game/store';
-import { Button, Card, OvrBadge, PosBadge, Segmented, Stat } from '@/components/ui';
+import { Button, Card, Modal, OvrBadge, PosBadge, Segmented, Stat } from '@/components/ui';
 import { NegotiationModal } from '@/components/Negotiation';
 import { fmtMoney, ovrOf, POS_GROUP } from '@/game/players';
 import { NATION_FLAGS } from '@/game/data';
-import type { MarketPlayer, NewsType } from '@/game/types';
+import type { MarketPlayer, NewsType, StaffRole } from '@/game/types';
 import { cn } from '@/utils/cn';
-import { newGame } from '@/game/initial';
-import { LeagueTable } from './MatchPage';
+import { newGame, newGameWithClub, presetById } from '@/game/initial';
+import { WorldStandings } from '@/components/WorldStandings';
+import { CLUB_BY_ID } from '@/game/world/db';
+import { ClubSelect } from './ClubSelect';
 
 type Tab = 'transfer' | 'news' | 'save';
 
@@ -108,6 +110,21 @@ function TransferMarket() {
         </table>
       </div>
       {neg && <NegotiationModal mp={neg} onClose={() => setNeg(null)} />}
+      {(state.world?.transfers.length ?? 0) > 0 && (
+        <div className="mt-6 border-t border-white/5 pt-3">
+          <div className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-400">Riwayat Transfer Dunia</div>
+          <div className="max-h-56 space-y-1 overflow-y-auto text-xs">
+            {state.world!.transfers.slice(0, 40).map((t, i) => (
+              <div key={i} className={cn('flex items-center gap-2 rounded px-2 py-1', (t.to === state.club.name || t.from === state.club.name) ? 'bg-[var(--accent)]/10 text-white' : 'text-slate-400')}>
+                <span className="w-8 font-bold text-slate-500">{t.pos}</span>
+                <span className="flex-1 truncate"><b>{t.name}</b> · {t.from} → {t.to}</span>
+                <span className="font-bold">{fmtMoney(t.fee)}</span>
+                <span className="text-slate-600">M{t.season}·P{t.week}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </Card>
   );
 }
@@ -146,7 +163,7 @@ function NewsFeed() {
           })}
         </div>
       </Card>
-      <div><LeagueTable /></div>
+      <div><WorldStandings /></div>
     </div>
   );
 }
@@ -154,6 +171,7 @@ function NewsFeed() {
 function SaveGame() {
   const { state, slots, saveSlot, loadSlot, deleteSlot, lastAutosave, replaceState, toast, logout, matchRef } = useGame();
   const fileRef = useRef<HTMLInputElement>(null);
+  const [showClub, setShowClub] = useState(false);
   const exportSave = () => {
     const blob = new Blob([JSON.stringify(state)], { type: 'application/json' });
     const a = document.createElement('a');
@@ -178,8 +196,17 @@ function SaveGame() {
   const reset = () => {
     if (!confirm('Mulai karier baru? Progres autosave akan ditimpa (slot manual tetap aman).')) return;
     matchRef.current = null;
-    replaceState(newGame(state.account, state.club.name));
+    const preset = presetById(state.clubPresetId);
+    const restartId = preset?.id ?? (state.clubPresetId && CLUB_BY_ID.has(state.clubPresetId) ? state.clubPresetId : null);
+    replaceState(restartId ? newGameWithClub(state.account, restartId, state.role ?? 'Manajer') : newGame(state.account, state.club.name));
     toast('Karier baru dimulai', 'info');
+  };
+  const changeClub = (presetId: string, role: StaffRole) => {
+    if (!confirm('Ganti klub akan memulai karier baru dari awal (slot manual tetap aman). Lanjut?')) return;
+    matchRef.current = null;
+    replaceState(newGameWithClub(state.account, presetId, role));
+    setShowClub(false);
+    toast('Selamat datang di klub barumu!', 'info');
   };
   const avgRating = Math.round(state.squad.map(ovrOf).sort((a, b) => b - a).slice(0, 11).reduce((a, b) => a + b, 0) / 11);
   const totalGoals = state.squad.reduce((a, p) => a + p.goals, 0);
@@ -191,7 +218,8 @@ function SaveGame() {
           <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[var(--accent)] text-2xl font-black text-[var(--accent-text)]">{state.account[0]?.toUpperCase()}</div>
           <div>
             <div className="text-lg font-black text-white">{state.account}</div>
-            <div className="text-xs text-slate-400">Manajer {state.club.name}</div>
+            <div className="text-xs text-slate-400">{state.role ?? 'Manajer'} · {state.club.name}</div>
+            {state.clubTier && <div className="text-[11px] text-slate-500">Tier {state.clubTier}{state.clubNation ? ` · ${state.clubNation}` : ''}{state.world ? ` · ${state.world.leagueName}` : ''}</div>}
           </div>
         </div>
         <div className="grid grid-cols-2 gap-2">
@@ -203,12 +231,19 @@ function SaveGame() {
         <div className="mt-4 rounded-lg bg-black/30 p-3 text-xs text-slate-400">
           <div className="flex items-center gap-2"><span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" /> Autosave aktif (localStorage perangkat ini)</div>
           <div className="mt-1">Terakhir: {lastAutosave ? new Date(lastAutosave).toLocaleTimeString('id-ID') : '—'}</div>
+          <div className="mt-1">🔒 Auth lokal per akun. Butuh sinkron antar perangkat? Firebase Auth / Supabase.</div>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2">
-          <Button variant="ghost" size="sm" onClick={logout}>Ganti Akun</Button>
+          <Button variant="ghost" size="sm" onClick={logout}>Logout</Button>
           <Button variant="danger" size="sm" onClick={reset}>Karier Baru</Button>
         </div>
+        <Button variant="outline" size="sm" className="mt-2 w-full" onClick={() => setShowClub(true)}>🔄 Ganti Klub</Button>
       </Card>
+      <Modal open={showClub} onClose={() => setShowClub(false)} className="max-w-4xl" title="Ganti Klub & Peran">
+        <div className="p-5">
+          <ClubSelect onConfirm={changeClub} initialRole={state.role ?? 'Manajer'} initialClubId={state.clubPresetId} confirmLabel="Pindah Klub ⚽" />
+        </div>
+      </Modal>
 
       <div className="space-y-5">
         <Card title="Slot Save Manual" icon="💾">

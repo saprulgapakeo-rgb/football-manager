@@ -3,7 +3,7 @@ import { useGame, type Page } from '@/game/store';
 import { ClubLogo } from './ClubVisuals';
 import { cn } from '@/utils/cn';
 import { fmtMoney } from '@/game/players';
-import { LEAGUE_NAME } from '@/game/data';
+import { leagueNameOf } from '@/game/world/engine';
 import { sortTable, totalRounds } from '@/game/league';
 
 const NAV: { id: Page; label: string; sub: string; icon: ReactNode }[] = [
@@ -31,7 +31,7 @@ export function Layout({ children }: { children: ReactNode }) {
             <ClubLogo club={state.club} size={52} className="drop-shadow-lg" />
             <div className="min-w-0">
               <div className="truncate font-black text-white drop-shadow">{state.club.name}</div>
-              <div className="text-[11px] font-semibold text-white/80 drop-shadow">#{pos} {LEAGUE_NAME}</div>
+              <div className="text-[11px] font-semibold text-white/80 drop-shadow">#{pos} {leagueNameOf(state)}</div>
             </div>
           </div>
         </div>

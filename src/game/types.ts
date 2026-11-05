@@ -24,6 +24,7 @@ export interface Player {
   assists: number;
   ratingSum: number;
   club?: string;
+  contractYears?: number; // seasons remaining on contract
 }
 
 export type Formation = '4-4-2' | '4-3-3' | '3-5-2' | '4-2-3-1' | '5-3-2';
@@ -78,6 +79,8 @@ export interface Fixture {
   ag?: number;
 }
 
+export type StaffRole = 'Manajer' | 'Pelatih';
+
 export type NewsType = 'match' | 'transfer' | 'training' | 'club' | 'season';
 
 export interface NewsItem {
@@ -92,13 +95,59 @@ export interface NewsItem {
 
 export interface MarketPlayer extends Player {
   club: string;
+  clubId?: string; // world DB club id (absent on legacy random listings)
   askingPrice: number; // in M
   status: 'available' | 'rejected';
+}
+
+// ---------- Global football database (mutable career-side state) ----------
+export interface CupFixture {
+  md: number; // matchday index (1-based)
+  home: string; away: string; // DB club ids
+  hg?: number; ag?: number;
+  group?: number; // group index for group-stage games
+  round?: string; // 'R16' | 'QF' | 'SF' | 'F' for knockout games
+  winner?: string;
+}
+
+export interface CompetitionState {
+  id: string; name: string; short: string; season: number;
+  teams: string[];
+  groups: { teams: string[]; table: TableRow[] }[];
+  fixtures: CupFixture[];
+  schedule: number[]; // league-week at which matchday k (index k-1) is played
+  mdDone: number;
+  stage: 'group' | 'ko' | 'done';
+  champion?: string;
+}
+
+export interface TransferRecord {
+  season: number; week: number; playerId: string; name: string; pos: Pos;
+  from: string; to: string; fee: number; ts: number;
+}
+
+export interface WorldState {
+  leagueId: string; // 'legacy' for pre-database careers
+  clubId: string; // DB club id of the user's club ('user' for legacy)
+  nationId: string | null;
+  leagueName: string;
+  leagueMembers: Record<string, string[]>; // leagueId -> club ids (mutable: promotion/relegation)
+  tables: Record<string, TableRow[]>; // standings of every league except the user's (kept in GameState.table)
+  removed: Record<string, string[]>; // clubId -> player ids that left the generated base squad
+  added: Record<string, Player[]>; // clubId -> players that joined (transfers)
+  transfers: TransferRecord[];
+  comps: CompetitionState[];
+  pendingCup: { compId: string; md: number; home: string; away: string } | null;
+  honours: { season: number; title: string }[];
 }
 
 export interface GameState {
   version: number;
   account: string;
+  role?: StaffRole;
+  clubPresetId?: string;
+  clubTier?: string;
+  clubNation?: string;
   club: ClubIdentity;
   squad: Player[];
   lineup: string[]; // 11 ids following formation slots
@@ -117,4 +166,8 @@ export interface GameState {
   news: NewsItem[];
   lastLoginDay: string;
   createdAt: number;
+  world?: WorldState; // added by the global database upgrade; migrated lazily for old saves
+  autoSub?: boolean; // automatic substitutions for the user's team (default true)
+  autoSubThreshold?: number; // fitness threshold that triggers an automatic substitution (default 60)
+  autoUpgrade?: boolean; // automatic special-training upgrades for prospects (default false)
 }

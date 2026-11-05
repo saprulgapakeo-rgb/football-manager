@@ -21,12 +21,16 @@ function Pages() {
 
 export default function App() {
   const [account, setAccount] = useState<string | null>(() => localStorage.getItem(SESSION_KEY));
-  if (!account) {
-    return <LoginScreen onLogin={(n) => { localStorage.setItem(SESSION_KEY, n); setAccount(n); }} />;
-  }
   return (
-    <GameProvider key={account} account={account} onLogout={() => { localStorage.removeItem(SESSION_KEY); setAccount(null); }}>
-      <Pages />
-    </GameProvider>
+    <>
+      {account ? (
+        <GameProvider key={account} account={account} onLogout={() => { localStorage.removeItem(SESSION_KEY); setAccount(null); }}>
+          <Pages />
+        </GameProvider>
+      ) : (
+        <LoginScreen onLogin={(n) => { localStorage.setItem(SESSION_KEY, n); setAccount(n); }} />
+      )}
+      <div className="fmco-watermark" aria-hidden="true">made by zabs</div>
+    </>
   );
 }
